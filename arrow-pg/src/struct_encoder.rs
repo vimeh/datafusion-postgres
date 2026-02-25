@@ -122,7 +122,7 @@ pub(crate) fn encode_struct<T: Encoder>(
 ) -> PgWireResult<()> {
     let arr = arr.as_any().downcast_ref::<StructArray>().unwrap();
     if arr.is_null(idx) {
-        return Ok(());
+        return encoder.encode_field(&None::<&[i8]>, parent_pg_field_info);
     }
 
     let fields = arrow_fields

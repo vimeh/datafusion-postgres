@@ -535,6 +535,7 @@ pub fn encode_value<T: Encoder>(
 
 #[cfg(test)]
 mod tests {
+    use arrow::buffer::NullBuffer;
     use bytes::BytesMut;
     use pgwire::{api::results::FieldFormat, types::format::FormatOptions};
     use postgres_types::Type;
@@ -587,6 +588,58 @@ mod tests {
         assert!(result.is_ok());
 
         assert!(encoder.encoded_value == val);
+    }
+
+    #[test]
+    fn encode_struct_null_emits_field() {
+        // Regression test: encode_struct must call encoder.encode_field for
+        // NULL struct values so a NULL indicator is written to the DataRow.
+        // Previously it returned Ok(()) without encoding, corrupting the
+        // column count.
+
+        #[derive(Default)]
+        struct CountingEncoder {
+            call_count: usize,
+        }
+
+        impl Encoder for CountingEncoder {
+            type Item = ();
+
+            fn encode_field<T>(&mut self, _value: &T, _pg_field: &FieldInfo) -> PgWireResult<()>
+            where
+                T: ToSql + ToSqlText + Sized,
+            {
+                self.call_count += 1;
+                Ok(())
+            }
+
+            fn take_row(&mut self) -> Self::Item {}
+        }
+
+        let fields = vec![
+            Arc::new(Field::new("a", DataType::Utf8, true)),
+            Arc::new(Field::new("b", DataType::Utf8, true)),
+        ];
+        let a = Arc::new(StringArray::from(vec![Some("hello"), Some("x")])) as Arc<dyn Array>;
+        let b = Arc::new(StringArray::from(vec![Some("world"), Some("y")])) as Arc<dyn Array>;
+
+        // Row 0: non-null struct, Row 1: null struct
+        let null_buffer = NullBuffer::from(vec![true, false]);
+        let struct_arr: Arc<dyn Array> = Arc::new(
+            StructArray::try_new(fields.clone().into(), vec![a, b], Some(null_buffer)).unwrap(),
+        );
+
+        let arrow_field = Field::new("s", DataType::Struct(fields.into()), true);
+        let pg_field = FieldInfo::new("s".to_string(), None, None, Type::TEXT, FieldFormat::Text);
+
+        // Encode the NULL row (index 1).
+        let mut encoder = CountingEncoder::default();
+        let result = encode_value(&mut encoder, &struct_arr, 1, &arrow_field, &pg_field);
+        assert!(result.is_ok());
+        assert_eq!(
+            encoder.call_count, 1,
+            "encode_field must be called exactly once for a NULL struct to emit a NULL indicator"
+        );
     }
 
     #[test]
