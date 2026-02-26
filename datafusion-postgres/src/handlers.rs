@@ -17,6 +17,7 @@ use pgwire::api::results::{FieldInfo, Response, Tag};
 use pgwire::api::stmt::QueryParser;
 use pgwire::api::{ClientInfo, ErrorHandler, PgWireServerHandlers, Type};
 use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::messages::PgWireBackendMessage;
 use pgwire::types::format::FormatOptions;
 
 use crate::hooks::set_show::SetShowHook;
@@ -119,10 +120,11 @@ impl DfSessionService {
 impl SimpleQueryHandler for DfSessionService {
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
-        C: ClientInfo + Unpin + Send + Sync,
+        C: ClientInfo + futures::Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
     {
-        log::debug!("Received query: {query}"); // Log the query for debugging
-
+        log::debug!("Received query: {query}");
         let statements = self
             .parser
             .sql_parser
@@ -206,11 +208,12 @@ impl ExtendedQueryHandler for DfSessionService {
         _max_rows: usize,
     ) -> PgWireResult<Response>
     where
-        C: ClientInfo + Unpin + Send + Sync,
+        C: ClientInfo + futures::Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
     {
         let query = &portal.statement.statement.0;
-        log::debug!("Received execute extended query: {query}"); // Log for debugging
-
+        log::debug!("Received execute extended query: {query}");
         // Check query hooks first
         if !self.query_hooks.is_empty() {
             if let (_, Some((statement, plan))) = &portal.statement.statement {
@@ -243,13 +246,12 @@ impl ExtendedQueryHandler for DfSessionService {
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
 
             let param_values =
-                df::deserialize_parameters(portal, &ordered_param_types(&param_types))?; // Fixed: Use &param_types
+                df::deserialize_parameters(portal, &ordered_param_types(&param_types))?;
 
             let plan = plan
                 .clone()
                 .replace_params_with_values(&param_values)
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?; // Fixed: Use
-                                                                   // &param_values
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
             let optimised = self
                 .session_context
                 .state()
@@ -345,8 +347,7 @@ impl QueryParser for Parser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        log::debug!("Received parse extended query: {sql}"); // Log for debugging
-
+        log::debug!("Received parse extended query: {sql}");
         let mut statements = self
             .sql_parser
             .parse(sql)
@@ -384,7 +385,6 @@ impl QueryParser for Parser {
 
             let mut param_types = Vec::with_capacity(params.len());
             for param_type in ordered_param_types(&params).iter() {
-                // Fixed: Use &params
                 if let Some(datatype) = param_type {
                     let pgtype = into_pg_type(datatype)?;
                     param_types.push(pgtype);
@@ -434,6 +434,8 @@ mod tests {
     use super::*;
     use crate::testing::MockClient;
 
+    use crate::hooks::HookClient;
+
     struct TestHook;
 
     #[async_trait]
@@ -442,7 +444,7 @@ mod tests {
             &self,
             statement: &sqlparser::ast::Statement,
             _ctx: &SessionContext,
-            _client: &mut (dyn ClientInfo + Sync + Send),
+            _client: &mut dyn HookClient,
         ) -> Option<PgWireResult<Response>> {
             if statement.to_string().contains("magic") {
                 Some(Ok(Response::EmptyQuery))
@@ -466,7 +468,7 @@ mod tests {
             _logical_plan: &LogicalPlan,
             _params: &ParamValues,
             _session_context: &SessionContext,
-            _client: &mut (dyn ClientInfo + Send + Sync),
+            _client: &mut dyn HookClient,
         ) -> Option<PgWireResult<Response>> {
             None
         }
@@ -522,5 +524,85 @@ mod tests {
         assert!(matches!(results[1], Response::Query(_)));
         assert!(matches!(results[2], Response::EmptyQuery));
         assert!(matches!(results[3], Response::Query(_)));
+    }
+
+    #[tokio::test]
+    async fn test_set_sends_parameter_status_via_sink() {
+        use pgwire::messages::PgWireBackendMessage;
+
+        let service = crate::testing::setup_handlers();
+        let mut client = MockClient::new();
+
+        let test_cases = vec![
+            ("SET datestyle = 'ISO, MDY'", "DateStyle", "ISO, MDY"),
+            (
+                "SET intervalstyle = 'postgres'",
+                "IntervalStyle",
+                "postgres",
+            ),
+            ("SET bytea_output = 'hex'", "bytea_output", "hex"),
+            (
+                "SET application_name = 'myapp'",
+                "application_name",
+                "myapp",
+            ),
+            ("SET search_path = 'public'", "search_path", "public"),
+            ("SET extra_float_digits = '2'", "extra_float_digits", "2"),
+            (
+                "SET TIME ZONE 'America/New_York'",
+                "TimeZone",
+                "America/New_York",
+            ),
+        ];
+
+        for (sql, expected_key, expected_value) in test_cases {
+            client.sent_messages.clear();
+
+            let responses =
+                <DfSessionService as SimpleQueryHandler>::do_query(&service, &mut client, sql)
+                    .await
+                    .unwrap();
+
+            assert!(
+                matches!(responses[0], Response::Execution(_)),
+                "Expected SET tag for {sql}"
+            );
+
+            let ps_msgs: Vec<_> = client
+                .sent_messages()
+                .iter()
+                .filter_map(|m| match m {
+                    PgWireBackendMessage::ParameterStatus(ps) => Some(ps),
+                    _ => None,
+                })
+                .collect();
+
+            assert_eq!(ps_msgs.len(), 1, "Expected 1 ParameterStatus for {sql}");
+            assert_eq!(ps_msgs[0].name, expected_key, "Wrong key for {sql}");
+            assert_eq!(ps_msgs[0].value, expected_value, "Wrong value for {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_statement_timeout_no_parameter_status() {
+        use pgwire::messages::PgWireBackendMessage;
+
+        let service = crate::testing::setup_handlers();
+        let mut client = MockClient::new();
+
+        <DfSessionService as SimpleQueryHandler>::do_query(
+            &service,
+            &mut client,
+            "SET statement_timeout TO '5000ms'",
+        )
+        .await
+        .unwrap();
+
+        let has_ps = client
+            .sent_messages()
+            .iter()
+            .any(|m| matches!(m, PgWireBackendMessage::ParameterStatus(_)));
+
+        assert!(!has_ps, "statement_timeout should not send ParameterStatus");
     }
 }
